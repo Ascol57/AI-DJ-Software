@@ -40,7 +40,7 @@ export class AnalysisManager {
         { file_path: track.file_path },
         {
           headers: { 'X-API-Key': this.apiKey, 'X-Signature': signature },
-          timeout: 60000 // 60 seconds hard timeout to prevent deadlocks
+          timeout: 180000 // 3 min: intro+outro analysis + first-run model downloads can exceed 60s
         }
       );
 
@@ -50,8 +50,9 @@ export class AnalysisManager {
       await this.db.run(`
         INSERT OR REPLACE INTO audio_features
           (track_id, bpm, bpm_confidence, key_camelot, key_name, key_confidence,
-           energy, danceability, loudness_lufs, intro_end_ms, drop_start_ms, outro_start_ms, phrase_boundaries_json, vocal_segments_json, beatgrid_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           energy, danceability, loudness_lufs, intro_end_ms, drop_start_ms, outro_start_ms, phrase_boundaries_json, vocal_segments_json, beatgrid_json,
+           intro_bpm, outro_bpm, intro_key_camelot, outro_key_camelot, key_changes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         trackId,
         features.bpm ?? null,
@@ -68,6 +69,11 @@ export class AnalysisManager {
         features.phrase_boundaries_ms ? JSON.stringify(features.phrase_boundaries_ms) : '[]',
         features.vocal_segments_ms ? JSON.stringify(features.vocal_segments_ms) : '[]',
         features.beat_frames_ms ? JSON.stringify(features.beat_frames_ms) : '[]',
+        features.intro_bpm ?? features.bpm ?? null,
+        features.outro_bpm ?? features.bpm ?? null,
+        features.intro_key_camelot ?? features.key_camelot ?? null,
+        features.outro_key_camelot ?? features.key_camelot ?? null,
+        features.key_changes ? 1 : 0,
       ]);
 
       await this.db.run(`

@@ -22,6 +22,38 @@ export interface RenderTrack {
     /** First detected beat (ms) — anchor for the constant-tempo beat grid used for phase-locking. */
     first_beat_ms?: number;
     transition_type?: string;
+    /** Camelot keys of the actual mix regions (for harmonic pitch matching). */
+    outro_key_camelot?: string;
+    intro_key_camelot?: string;
+    /** Key-detection confidence (0-1); pitch match is skipped when either track is unsure. */
+    key_confidence?: number;
+}
+
+/**
+ * Semitones to pitch-shift B so its intro key becomes harmonically compatible with A's
+ * outro key. 0 if already compatible (same/adjacent Camelot) or if the needed shift is
+ * too large to sound natural. Camelot number step = a perfect fifth = 7 semitones (mod 12).
+ */
+// Harmonic pitch matching: incoming track is held IN the previous track's key during the
+// overlap (constant → no clash), then eases back to its own key over a long gentle slope
+// (PITCH_SETTLE_S). ≤2 semitones, gated on key-detection confidence.
+export const ENABLE_HARMONIC_PITCH = true;
+
+export function harmonicSemitones(aKey?: string, bKey?: string, maxSemitones = 2): number {
+    const parse = (k?: string) => {
+        const m = /^(\d{1,2})([AB])$/.exec((k ?? '').trim());
+        return m ? { n: parseInt(m[1], 10), l: m[2] } : null;
+    };
+    const a = parse(aKey), b = parse(bKey);
+    if (!a || !b) return 0;
+    const dNum = Math.min((a.n - b.n + 12) % 12, (b.n - a.n + 12) % 12);
+    // Already harmonically compatible: same key family, relative, or one wheel step.
+    if (a.n === b.n || (a.l === b.l && dNum === 1)) return 0;
+    // Shift B's Camelot number onto A's (7·Δ mod 12), normalised to the nearest semitones.
+    let s = (7 * ((a.n - b.n) % 12)) % 12;
+    if (s > 6) s -= 12;
+    if (s < -6) s += 12;
+    return Math.abs(s) <= maxSemitones ? s : 0;
 }
 
 export interface RenderOptions {
@@ -53,7 +85,7 @@ const QUALITY_SETTINGS: Record<RenderFormat, Record<RenderQuality, string[]>> = 
 };
 
 /** Phase-locked blend window for one A→B pair (shared by the renderer and the preview). */
-export interface BlendPlan { aOutStart: number; aOutEnd: number; bInStart: number; bInEnd: number; warp: number; }
+export interface BlendPlan { aOutStart: number; aOutEnd: number; bInStart: number; bInEnd: number; warp: number; pitchSemitones: number; }
 
 // FFmpeg audio filters can panic on micro-transitions (<1s); cap the duration.
 const clampD = (ms: number) => (ms < 1000 ? 0 : Math.min(ms, 45000));
@@ -64,8 +96,34 @@ const snapToGrid = (ms: number, anchor: number, period: number, multiple = 1) =>
     const step = period * multiple;
     return anchor + Math.round((ms - anchor) / step) * step;
 };
-const warpOf = (bpmA: number, bpmB: number) =>
-    Math.max(0.5, Math.min(bpmA && bpmB ? bpmA / bpmB : 1.0, 2.0));
+// Tempo-match ratio for atempo. Octave-aware: fold B's BPM by factors of 2 into the
+// octave centred on A (|log2(r)| minimal) so half/double-tempo detections (e.g. 86 vs
+// 172) match with the SMALLEST stretch instead of a jarring ~1.4–2× warp.
+const warpOf = (bpmA: number, bpmB: number) => {
+    if (!bpmA || !bpmB) return 1.0;
+    let r = bpmA / bpmB;
+    while (r > 1.414) r /= 2;
+    while (r < 0.707) r *= 2;
+    return Math.max(0.5, Math.min(r, 2.0));
+};
+
+// How long (seconds) the incoming track takes to glide from the mixed key back to its
+// own natural key — a long, gentle slope so the pitch correction is imperceptible.
+const PITCH_SETTLE_S = 20;
+// Below this key-detection confidence we don't trust the key, so we don't pitch-shift
+// (avoids landing on the wrong key relative to the previous track).
+const PITCH_MIN_KEY_CONFIDENCE = 0.5;
+
+// Timed asendcmd list to glide a named rubberband instance's `pitch` from→to (ratios)
+// across `durS` seconds — a smooth pitch slope.
+const pitchRamp = (inst: string, from: number, to: number, durS: number, steps = 24) => {
+    const parts: string[] = [];
+    for (let k = 0; k <= steps; k++) {
+        const frac = k / steps;
+        parts.push(`${(frac * durS).toFixed(3)} ${inst} pitch ${(from + (to - from) * frac).toFixed(5)}`);
+    }
+    return parts.join('; ');
+};
 
 /**
  * Compute a phase-locked blend window for an A→B pair (null = hard cut, td=0).
@@ -73,6 +131,8 @@ const warpOf = (bpmA: number, bpmB: number) =>
  * `td*warp` of input so after atempo it is exactly `td` long → beat grids stay locked.
  */
 export function computeBlendPlan(A: RenderTrack, B: RenderTrack): BlendPlan | null {
+    // Hard cuts have no blend window — A plays to its cue_out, B starts at its cue_in.
+    if (A.transition_type === 'cut' || A.transition_type === 'instant_cut') return null;
     const td = clampD(A.transition_duration_ms);
     if (td === 0) return null;
     const pA = beatPeriod(A.bpm), pB = beatPeriod(B.bpm);
@@ -81,7 +141,18 @@ export function computeBlendPlan(A: RenderTrack, B: RenderTrack): BlendPlan | nu
     let bInStart = snapToGrid(B.cue_in_ms, B.first_beat_ms ?? 0, pB, 4);
     bInStart = Math.max(0, bInStart);
     const warp = warpOf(A.bpm, B.bpm);
-    return { aOutStart, aOutEnd: aOutStart + td, bInStart, bInEnd: bInStart + td * warp, warp };
+    // Harmonic match uses the ACTUAL mix-region keys (A's outro, B's intro). Disabled by
+    // default (ENABLE_HARMONIC_PITCH) — pitch-shifting whole tracks tends to sound worse
+    // than just picking compatible keys.
+    const keysTrusted = (A.key_confidence ?? 1) >= PITCH_MIN_KEY_CONFIDENCE
+        && (B.key_confidence ?? 1) >= PITCH_MIN_KEY_CONFIDENCE;
+    const pitchSemitones = (ENABLE_HARMONIC_PITCH && keysTrusted)
+        ? harmonicSemitones(
+            A.outro_key_camelot ?? (A as any).key_camelot,
+            B.intro_key_camelot ?? (B as any).key_camelot,
+        )
+        : 0;
+    return { aOutStart, aOutEnd: aOutStart + td, bInStart, bInEnd: bInStart + td * warp, warp, pitchSemitones };
 }
 
 /**
@@ -237,7 +308,17 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                 const ss = (soloStart / 1000).toFixed(3);
                 const se = (soloEnd / 1000).toFixed(3);
 
-                const filterSoloStr = `[0:a]atrim=start=${ss}:end=${se},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo[out]`;
+                // The previous blend held this track in the previous track's key. Now glide
+                // it back to its own natural key over a LONG, gentle slope (PITCH_SETTLE_S)
+                // so the correction is imperceptible — not an abrupt few-second shift.
+                const inShift = (i > 0 && trans[i - 1]) ? (trans[i - 1]!.pitchSemitones || 0) : 0;
+                let soloChain = `[0:a]atrim=start=${ss}:end=${se},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo`;
+                if (inShift !== 0) {
+                    const from = Math.pow(2, inShift / 12);
+                    const settleS = Math.min(PITCH_SETTLE_S, soloDur / 1000);
+                    soloChain += `,asendcmd=c='${pitchRamp('rubberband@rbs', from, 1.0, settleS)}',rubberband@rbs=pitch=${from.toFixed(5)}`;
+                }
+                const filterSoloStr = `${soloChain}[out]`;
 
                 tasks.push({
                     filename: file,
@@ -274,53 +355,68 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                 const isE = (inEnd / 1000).toFixed(3);
                 const dS = (td_curr / 1000).toFixed(3);
 
-                // EQ Swap parameters:
-                let rawRatio = t.bpm && next.bpm ? (t.bpm / next.bpm) : 1.0;
-                // FFmpeg atempo strictly requires values >= 0.5 and <= 100.0, or it crashes with 4294967262!
-                // We'll realistically clamp the warp effect between 0.5 (half speed) and 2.0 (double speed).
-                rawRatio = Math.max(0.5, Math.min(rawRatio, 2.0));
-                const warpRatio = rawRatio.toFixed(4);
+                // Octave-aware tempo match (same helper as the phase-lock plan → consistent).
+                const warpRatio = warpOf(t.bpm, next.bpm).toFixed(4);
 
                 let filterGraphA = '';
                 let filterGraphB = '';
                 const transType = (t as any).transition_type ?? 'equal_power';
 
+                // Common head: trim to the blend window, reset PTS, normalise format.
+                // B is additionally tempo-warped (atempo) to A's BPM — combined with the
+                // Pass-1 phase-locked boundaries, the beat grids stay aligned through the blend.
+                const preA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo`;
+
+                // Harmonic pitch match: CONSTANT shift of B to A's key for the overlap (no
+                // glide — a gliding pitch sounds like detuning). Off by default; ≤2 semitones.
+                const pitchS = plan.pitchSemitones || 0;
+                const pitchChainB = pitchS !== 0
+                    ? `,rubberband@rbp=pitch=${Math.pow(2, pitchS / 12).toFixed(5)}`
+                    : '';
+                const preB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio}${pitchChainB}`;
+
+                // Runtime frequency sweep for a *named* filter instance (asendcmd), since
+                // FFmpeg's highpass/lowpass cutoff can't take a `t` expression.
+                const sweep = (inst: string, fromHz: number, toHz: number, durS: number, steps = 12) => {
+                    const parts: string[] = [];
+                    for (let k = 0; k <= steps; k++) {
+                        const frac = k / steps;
+                        const f = Math.round(fromHz + (toHz - fromHz) * frac);
+                        parts.push(`${(frac * durS).toFixed(3)} ${inst} frequency ${f}`);
+                    }
+                    return parts.join('; ');
+                };
+
                 if (transType === 'echo_out') {
-                    filterGraphA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,afade=t=out:st=0:d=${Number(dS) / 4}:curve=nofade,aecho=1.0:0.7:400:0.5[a0];`;
-                    filterGraphB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio}[a1];`;
+                    // Hip-hop/trap: A fades with an echo tail, B drops straight in.
+                    filterGraphA = `${preA},afade=t=out:st=0:d=${Number(dS) / 4}:curve=nofade,aecho=1.0:0.7:400:0.5[a0];`;
+                    filterGraphB = `${preB}[a1];`;
                 } else if (transType === 'backspin') {
+                    // Dubstep/DnB: A brakes to a stop, B drops straight in.
                     const stopDur = Math.min(1.0, Number(dS));
-                    filterGraphA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,afade=t=out:st=0:d=${stopDur}:curve=exp[a0];`;
-                    filterGraphB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio}[a1];`;
+                    filterGraphA = `${preA},afade=t=out:st=0:d=${stopDur}:curve=exp[a0];`;
+                    filterGraphB = `${preB}[a1];`;
+                } else if (transType === 'filter_sweep') {
+                    // Ambient/trance: full low-pass sweep — A muffles out, B opens up.
+                    const cmdsA = sweep('lowpass@lpa', 20000, 250, Number(dS));
+                    const cmdsB = sweep('lowpass@lpb', 250, 20000, Number(dS));
+                    filterGraphA = `${preA},asendcmd=c='${cmdsA}',lowpass@lpa=f=20000,afade=t=out:st=0:d=${dS}:curve=qsin[a0];`;
+                    filterGraphB = `${preB},asendcmd=c='${cmdsB}',lowpass@lpb=f=250,afade=t=in:st=0:d=${dS}:curve=qsin[a1];`;
+                } else if (transType === 'linear') {
+                    // Simple linear crossfade, no EQ shaping.
+                    filterGraphA = `${preA},afade=t=out:st=0:d=${dS}:curve=tri[a0];`;
+                    filterGraphB = `${preB},afade=t=in:st=0:d=${dS}:curve=tri[a1];`;
                 } else {
-                    // Default Transition: beatmatched equal-power crossfade + bass swap.
-                    // B is tempo-warped to A's BPM (atempo); Pass-1 boundaries put both beat
-                    // grids on the same phase, so the blend is phase-locked. qsin fades give a
-                    // constant-power (no dip) crossfade for the mids/highs.
-                    //
-                    // Bass swap: a swept high-pass whose cutoff RISES on the outgoing track
-                    // (bass leaves) and FALLS on the incoming track (bass enters), so the two
-                    // kicks/basslines never stack. FFmpeg's highpass frequency can't take a
-                    // `t` expression, so we drive it at runtime with asendcmd on a *named*
-                    // filter instance (highpass@hpa / highpass@hpb) — a series of timed steps
-                    // interpolated across the blend. (This is why the old `highpass=f=200*t/…`
-                    // was invalid and silently dropped every transition.)
-                    const BASS_HZ = 240;        // how high we lift the low-cut at the swap peak
-                    const sweep = (inst: string, fromHz: number, toHz: number, durS: number, steps = 12) => {
-                        const parts: string[] = [];
-                        for (let k = 0; k <= steps; k++) {
-                            const frac = k / steps;
-                            const tSec = (frac * durS).toFixed(3);
-                            const f = Math.round(fromHz + (toHz - fromHz) * frac);
-                            parts.push(`${tSec} ${inst} frequency ${f}`);
-                        }
-                        return parts.join('; ');
-                    };
+                    // equal_power (default) and s_curve: constant-power crossfade + BASS SWAP.
+                    // Bass swap: swept high-pass cutoff RISES on A (bass leaves) and FALLS on B
+                    // (bass enters), so the two basslines/kicks never stack. s_curve uses an
+                    // S-shaped fade (esin); equal_power uses qsin.
+                    const curve = transType === 's_curve' ? 'esin' : 'qsin';
+                    const BASS_HZ = 240;
                     const cmdsA = sweep('highpass@hpa', 20, BASS_HZ, Number(dS));   // A: bass sweeps OUT
                     const cmdsB = sweep('highpass@hpb', BASS_HZ, 20, Number(dS));   // B: bass sweeps IN
-
-                    filterGraphA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,asendcmd=c='${cmdsA}',highpass@hpa=f=20,afade=t=out:st=0:d=${dS}:curve=qsin[a0];`;
-                    filterGraphB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio},asendcmd=c='${cmdsB}',highpass@hpb=f=${BASS_HZ},afade=t=in:st=0:d=${dS}:curve=qsin[a1];`;
+                    filterGraphA = `${preA},asendcmd=c='${cmdsA}',highpass@hpa=f=20,afade=t=out:st=0:d=${dS}:curve=${curve}[a0];`;
+                    filterGraphB = `${preB},asendcmd=c='${cmdsB}',highpass@hpb=f=${BASS_HZ},afade=t=in:st=0:d=${dS}:curve=${curve}[a1];`;
                 }
 
                 const filterComplexStr = filterGraphA + filterGraphB + `[a0][a1]amix=inputs=2:duration=longest:normalize=0,aformat=sample_fmts=s16:channel_layouts=stereo[out]`;

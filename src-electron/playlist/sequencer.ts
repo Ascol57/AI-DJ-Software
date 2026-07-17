@@ -274,7 +274,9 @@ export class PlaylistSequencer {
     const pl = await this.db.get<any>('SELECT * FROM playlists WHERE playlist_id = ?', [playlistId]);
     if (!pl) return null;
     const pts = await this.db.all<any>(`
-      SELECT pt.*, t.*, f.bpm, f.key_camelot, f.energy, f.beatgrid_json, c.genre_primary, c.mood_primary
+      SELECT pt.*, t.*, f.bpm, f.key_camelot, f.key_confidence, f.energy, f.beatgrid_json,
+             f.intro_bpm, f.outro_bpm, f.intro_key_camelot, f.outro_key_camelot,
+             c.genre_primary, c.mood_primary
       FROM playlist_tracks pt
       JOIN tracks t ON pt.track_id = t.track_id
       LEFT JOIN audio_features f ON t.track_id = f.track_id

@@ -239,6 +239,40 @@ const ModelStatusSection: React.FC = () => {
   );
 };
 
+const ReanalyzeSection: React.FC = () => {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  useEffect(() => {
+    const done = () => { setBusy(false); setMsg('Ré-analyse terminée ✓'); };
+    ipc.on?.('library:reanalyze-complete', done);
+    return () => ipc.off?.('library:reanalyze-complete', done);
+  }, []);
+  const run = async () => {
+    setBusy(true); setMsg('');
+    try {
+      const r = await ipc.invoke('library:reanalyze-all');
+      setMsg(`Ré-analyse de ${r?.queued ?? 0} morceaux en cours… (BPM, tonalité, beatgrid, intro/outro)`);
+    } catch (e: any) { setBusy(false); setMsg('Erreur : ' + (e?.message ?? '')); }
+  };
+  return (
+    <section style={{ marginBottom: 36 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 14 }}>Analyse</div>
+      <Card>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Ré-analyser toute la bibliothèque</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Recalcule BPM, tonalité, beatgrid et les nouvelles tonalités d'intro / outro pour tous les morceaux.</div>
+          </div>
+          <button onClick={run} disabled={busy} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid rgba(124,109,255,0.3)', background: busy ? 'rgba(124,109,255,0.15)' : 'var(--accent)', color: busy ? 'var(--accent)' : '#fff', fontSize: 12, fontWeight: 600, cursor: busy ? 'default' : 'pointer', whiteSpace: 'nowrap' }}>
+            {busy ? '⏳ En cours…' : '↻ Ré-analyser'}
+          </button>
+        </div>
+        {msg && <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 12 }}>{msg}</p>}
+      </Card>
+    </section>
+  );
+};
+
 const SettingsView: React.FC = () => {
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [settings, setSettings] = useState<AppSettings>({ sample_rate: 44100, buffer_size: 256, watched_folders: [] });
@@ -431,6 +465,9 @@ const SettingsView: React.FC = () => {
           </div>
         </Card>
       </section>
+
+      {/* ── Library analysis ── */}
+      <ReanalyzeSection />
 
       {/* ── AI Models ── */}
       <ModelStatusSection />

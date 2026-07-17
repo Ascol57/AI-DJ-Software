@@ -93,9 +93,10 @@ export function planTransition(
   const beatDurationMs = (60 * 1000) / safeBpmA;
   let transitionDurationMs = Math.round(bars * 4 * beatDurationMs);
 
-  // --- SAFETY CAP 0: FFmpeg acrossfade limit ---
-  if (transitionDurationMs > 45000) {
-    transitionDurationMs = 45000;
+  // --- CAP 0: keep blends punchy (long 16–32 bar blends drone and expose any
+  // tempo/key mismatch). 16s is a musical upper bound for an auto-mix. ---
+  if (transitionDurationMs > 16000) {
+    transitionDurationMs = 16000;
   }
 
   // 2. SAFETY CAP: Duration cannot exceed 30% of either track total length
@@ -106,15 +107,12 @@ export function planTransition(
   }
 
   // 3. Outgoing Segment (A)
-  // Ensure the track plays for a good portion, BUT strictly cap at 29 seconds to evade copyright strikes
-  const MAX_PLAYBACK_MS = 29000;
-
-  let finalCueOutMs = trackAOutroStartMs > 0 ? trackAOutroStartMs : Math.round(trackADurationMs * 0.85);
-
-  // Apply maximum limit: Track A cannot play for more than 29 seconds total
-  if ((finalCueOutMs - trackACueInMs) > MAX_PLAYBACK_MS) {
-    finalCueOutMs = trackACueInMs + MAX_PLAYBACK_MS;
-  }
+  // Exit at the outro so the track plays out and the blend lands near the END of the
+  // song (proper DJ behaviour). No artificial 29s cap — this is a local mixing tool.
+  // (outro detection can occasionally report past the track end, so guard against that.)
+  let finalCueOutMs = (trackAOutroStartMs > 0 && trackAOutroStartMs < trackADurationMs)
+    ? trackAOutroStartMs
+    : Math.round(trackADurationMs * 0.9);
 
   // Boundary check
   if (finalCueOutMs > trackADurationMs) finalCueOutMs = trackADurationMs;

@@ -23,6 +23,34 @@ def _librosa_key_to_name(key_idx: int, scale: str) -> str:
     return f"{name} {mode}"
 
 
+_MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+_MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+def _key_from_harmonic(y_harm, sr):
+    """Krumhansl key detection on an ALREADY harmonic signal (no HPSS here) → camelot."""
+    import librosa
+    import numpy as np
+    cm = np.mean(librosa.feature.chroma_cqt(y=y_harm, sr=sr), axis=1)
+    maj = [np.corrcoef(np.roll(_MAJOR_PROFILE, -i), cm)[0, 1] for i in range(12)]
+    mnr = [np.corrcoef(np.roll(_MINOR_PROFILE, -i), cm)[0, 1] for i in range(12)]
+    bmaj = max(enumerate(maj), key=lambda x: x[1])
+    bmin = max(enumerate(mnr), key=lambda x: x[1])
+    name = f"{KEY_NAMES[bmaj[0]]} major" if bmaj[1] >= bmin[1] else f"{KEY_NAMES[bmin[0]]} minor"
+    return CAMELOT_MAP.get(name, "?")
+
+
+def _bpm_from_percussive(y_perc, sr, fallback):
+    """Tempo from an ALREADY percussive signal (no HPSS here)."""
+    import librosa
+    try:
+        t, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
+        v = float(t[0] if hasattr(t, '__len__') else t)
+        return round(v, 2) if v > 0 else fallback
+    except Exception:
+        return fallback
+
+
 def extract_features(file_path: str, y=None, sr=None, true_duration_ms=None) -> dict:
     """
     Extract audio features using librosa.
@@ -207,12 +235,45 @@ def extract_features(file_path: str, y=None, sr=None, true_duration_ms=None) -> 
             print(f"[ML] Vocal detection failed: {e}")
             vocal_segments_ms = []
 
+        # --- INTRO / OUTRO region analysis ---
+        # Key/tempo can change over a track; what matters for mixing is the actual
+        # mix-in (intro) and mix-out (outro) sections, not a global average.
+        # Cost-conscious: reuse the already-computed y_harm/y_perc for the intro
+        # (no extra HPSS) and do exactly ONE HPSS for the outro.
+        REGION_S = 30.0
+        gbpm = round(bpm, 2)
+        intro_bpm = outro_bpm = gbpm
+        intro_key_camelot = outro_key_camelot = key_camelot
+        key_changes = False
+        try:
+            n = int(REGION_S * sr)
+            intro_key_camelot = _key_from_harmonic(y_harm[:n], sr)
+            intro_bpm = _bpm_from_percussive(y_perc[:n], sr, gbpm)
+
+            full_dur_s = (true_duration_ms / 1000.0) if true_duration_ms else librosa.get_duration(path=file_path)
+            off = max(0.0, full_dur_s - REGION_S)
+            # y only covers the first 120s, so load the true outro region separately.
+            if off > REGION_S:  # long enough to have a distinct outro
+                y_out, sr_out = librosa.load(file_path, sr=22050, mono=True, offset=off, duration=REGION_S)
+                if len(y_out) > sr_out:  # need at least ~1s of audio
+                    yh, yp = librosa.effects.hpss(y_out)
+                    outro_key_camelot = _key_from_harmonic(yh, sr_out)
+                    outro_bpm = _bpm_from_percussive(yp, sr_out, gbpm)
+            key_changes = (intro_key_camelot != outro_key_camelot)
+        except Exception as e:
+            print(f"[ML] intro/outro analysis failed: {e}")
+
         return {
             "bpm": round(bpm, 2),
             "bpm_confidence": 0.85,
             "key_camelot": key_camelot,
             "key_name": key_name,
             "key_confidence": round(max(0.0, min(1.0, key_confidence)), 3),
+            "intro_bpm": intro_bpm,
+            "outro_bpm": outro_bpm,
+            "intro_key_camelot": intro_key_camelot,
+            "outro_key_camelot": outro_key_camelot,
+            "key_changes": bool(key_changes),
             "energy": round(energy_normalized, 4),
             "danceability": round(danceability, 4),
             "loudness_lufs": round(loudness_lufs, 2),

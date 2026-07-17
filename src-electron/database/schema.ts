@@ -47,7 +47,12 @@ CREATE TABLE IF NOT EXISTS audio_features (
     vocal_segments_json TEXT,
     beatgrid_json TEXT,
     mfccs_json TEXT,
-    chroma_json TEXT
+    chroma_json TEXT,
+    intro_bpm REAL,
+    outro_bpm REAL,
+    intro_key_camelot TEXT,
+    outro_key_camelot TEXT,
+    key_changes INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS classifications (
@@ -167,4 +172,9 @@ export const COLUMN_MIGRATIONS: string[] = [
     `ALTER TABLE audio_features ADD COLUMN phrase_boundaries_json TEXT`,
     `ALTER TABLE audio_features ADD COLUMN vocal_segments_json TEXT`,
     `ALTER TABLE audio_features ADD COLUMN beatgrid_json TEXT`,
+    `ALTER TABLE audio_features ADD COLUMN intro_bpm REAL`,
+    `ALTER TABLE audio_features ADD COLUMN outro_bpm REAL`,
+    `ALTER TABLE audio_features ADD COLUMN intro_key_camelot TEXT`,
+    `ALTER TABLE audio_features ADD COLUMN outro_key_camelot TEXT`,
+    `ALTER TABLE audio_features ADD COLUMN key_changes INTEGER DEFAULT 0`,
 ];

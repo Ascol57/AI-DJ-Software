@@ -156,6 +156,18 @@ function registerIpcHandlers(win: BrowserWindow) {
     return { success: true };
   });
 
+  // Re-analyse the WHOLE library from scratch (re-computes bpm/key/beats + the new
+  // intro/outro key & tempo). Marks every track pending and drains the queue.
+  ipcMain.handle('library:reanalyze-all', async () => {
+    await (db as any).run('UPDATE tracks SET is_analyzed = 0');
+    const row = await db.get<any>('SELECT COUNT(*) AS c FROM tracks');
+    // Fire-and-forget: the queue re-analyses everything; UI can poll analysis events.
+    analysis.runAnalysisQueue(4)
+      .then(() => win.webContents.send('library:reanalyze-complete'))
+      .catch((e: Error) => console.error('[AI DJ] Reanalyze queue error:', e));
+    return { queued: row?.c ?? 0 };
+  });
+
   // ────────────── WAVEFORM ──────────────
 
   ipcMain.handle('waveform:get', async (_event, trackId: string) => {
@@ -400,6 +412,10 @@ function registerIpcHandlers(win: BrowserWindow) {
       bpm: (pt.track as any).bpm ?? 128,
       // First detected beat → anchor for phase-locked beatmatching in the renderer.
       first_beat_ms: (pt.track as any).beat_frames_ms?.[0] ?? 0,
+      // Mix-region keys for harmonic pitch matching.
+      outro_key_camelot: (pt.track as any).outro_key_camelot ?? (pt.track as any).key_camelot,
+      intro_key_camelot: (pt.track as any).intro_key_camelot ?? (pt.track as any).key_camelot,
+      key_confidence: (pt.track as any).key_confidence,
     }));
 
     await renderMix({
@@ -440,6 +456,9 @@ function registerIpcHandlers(win: BrowserWindow) {
       artist: pt.track.artist,
       bpm: (pt.track as any).bpm ?? 128,
       first_beat_ms: (pt.track as any).beat_frames_ms?.[0] ?? 0,
+      outro_key_camelot: (pt.track as any).outro_key_camelot ?? (pt.track as any).key_camelot,
+      intro_key_camelot: (pt.track as any).intro_key_camelot ?? (pt.track as any).key_camelot,
+      key_confidence: (pt.track as any).key_confidence,
     });
 
     const { wav, blendStartMs, blendDurMs } = await renderTransitionPreview(toRT(pts[index]), toRT(pts[index + 1]));
