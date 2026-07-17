@@ -27,6 +27,8 @@ export interface RenderTrack {
     intro_key_camelot?: string;
     /** Key-detection confidence (0-1); pitch match is skipped when either track is unsure. */
     key_confidence?: number;
+    /** Track loudness (dB, RMS-based) — used to level-match tracks across the mix. */
+    loudness_lufs?: number;
 }
 
 /**
@@ -66,6 +68,8 @@ export interface RenderOptions {
     maxPitchSlope?: number;
     /** Max slope of the post-blend tempo settle, in BPM/second (gentler = smaller). */
     maxTempoSlope?: number;
+    /** Level-match tracks so none is much louder/quieter than the others (default true). */
+    normalizeLoudness?: boolean;
     onProgress?: (percent: number, currentTrack: string) => void;
     onError?: (msg: string) => void;
 }
@@ -281,6 +285,24 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
             .slice(0, -1)
             .map((A, i) => computeBlendPlan(A, tracks[i + 1]));
 
+        // ─── Loudness level-matching ───────────────────────────────────────
+        // Per-track gain toward the mix's MEDIAN loudness so no track is much
+        // louder/quieter than the rest. Boost capped (+6dB) and a brick-wall
+        // limiter after the gain prevents any clipping.
+        const gain: number[] = tracks.map(() => 0);
+        if (opts.normalizeLoudness !== false) {
+            const louds = tracks.map(t => t.loudness_lufs).filter((v): v is number => typeof v === 'number' && isFinite(v));
+            if (louds.length >= 2) {
+                const sorted = [...louds].sort((a, b) => a - b);
+                const target = sorted[Math.floor(sorted.length / 2)]; // median
+                tracks.forEach((t, i) => {
+                    const l = t.loudness_lufs;
+                    gain[i] = (typeof l === 'number' && isFinite(l)) ? Math.max(-12, Math.min(6, target - l)) : 0;
+                });
+            }
+        }
+        const gainChain = (g: number) => Math.abs(g) > 0.3 ? `,volume=${g.toFixed(2)}dB,alimiter=limit=0.95:level=disabled` : '';
+
         for (let i = 0; i < tracks.length; i++) {
             const t = tracks[i];
             const td_curr = i < tracks.length - 1 ? clampD(tracks[i].transition_duration_ms) : 0;
@@ -328,6 +350,7 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                     }
                     soloChain += `,asendcmd=c='${cmds.join('; ')}',rubberband@rbs=pitch=${fromPitch.toFixed(5)}:tempo=${fromTempo.toFixed(5)}`;
                 }
+                soloChain += gainChain(gain[i]);   // level-match this track
                 const filterSoloStr = `${soloChain}[out]`;
 
                 tasks.push({
@@ -375,7 +398,7 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                 // Common head: trim to the blend window, reset PTS, normalise format.
                 // B is additionally tempo-warped (atempo) to A's BPM — combined with the
                 // Pass-1 phase-locked boundaries, the beat grids stay aligned through the blend.
-                const preA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo`;
+                const preA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo${gainChain(gain[i])}`;
 
                 // Harmonic pitch match: CONSTANT shift of B to A's key for the overlap (no
                 // glide — a gliding pitch sounds like detuning). Off by default; ≤2 semitones.
@@ -383,7 +406,7 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                 const pitchChainB = pitchS !== 0
                     ? `,rubberband@rbp=pitch=${Math.pow(2, pitchS / 12).toFixed(5)}`
                     : '';
-                const preB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio}${pitchChainB}`;
+                const preB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio}${pitchChainB}${gainChain(gain[i + 1])}`;
 
                 // Runtime frequency sweep for a *named* filter instance (asendcmd), since
                 // FFmpeg's highpass/lowpass cutoff can't take a `t` expression.

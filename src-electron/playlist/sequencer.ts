@@ -89,9 +89,10 @@ export class PlaylistSequencer {
     }
 
     const allTracks = await this.db.all<AnalyzedTrack>(`
-      SELECT t.*, 
+      SELECT t.*,
              f.bpm, f.key_camelot, f.energy, f.danceability,
              f.outro_start_ms, f.intro_end_ms, f.drop_start_ms,
+             f.intro_key_camelot, f.outro_key_camelot,
              c.genre_primary, c.genre_secondary, c.genre_confidence, c.mood_primary
       FROM tracks t
       JOIN audio_features f ON t.track_id = f.track_id
@@ -277,7 +278,7 @@ export class PlaylistSequencer {
     const pl = await this.db.get<any>('SELECT * FROM playlists WHERE playlist_id = ?', [playlistId]);
     if (!pl) return null;
     const pts = await this.db.all<any>(`
-      SELECT pt.*, t.*, f.bpm, f.key_camelot, f.key_confidence, f.energy, f.beatgrid_json,
+      SELECT pt.*, t.*, f.bpm, f.key_camelot, f.key_confidence, f.energy, f.loudness_lufs, f.beatgrid_json,
              f.intro_bpm, f.outro_bpm, f.intro_key_camelot, f.outro_key_camelot,
              c.genre_primary, c.mood_primary
       FROM playlist_tracks pt
@@ -332,7 +333,8 @@ export class PlaylistSequencer {
       // so we always have candidates even in small genre pools.
       const result = scoreTrack(
         currentTrack.bpm,
-        currentTrack.key_camelot,
+        // Harmonic match uses the OUTGOING track's outro key vs the candidate's intro key.
+        (currentTrack as any).outro_key_camelot || currentTrack.key_camelot,
         [],           // embeddings not available in this path
         targetEnergy,
         t,

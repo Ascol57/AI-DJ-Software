@@ -39,6 +39,9 @@ const QUALITIES: QualityOption[] = [
 const RenderModal: React.FC<Props> = ({ playlistId, onClose }) => {
     const [format, setFormat] = useState<RenderFormat>('wav');
     const [quality, setQuality] = useState<RenderQuality>('high');
+    const [normLoud, setNormLoud] = useState(true);
+    const [tempoSlope, setTempoSlope] = useState(3);      // BPM/s (max)
+    const [pitchSlope, setPitchSlope] = useState(0.15);   // semitones/s (max)
     const [rendering, setRendering] = useState(false);
     const [progress, setProgress] = useState(0);
     const [currentTrack, setCurrentTrack] = useState('');
@@ -71,7 +74,12 @@ const RenderModal: React.FC<Props> = ({ playlistId, onClose }) => {
         setCurrentTrack('');
 
         try {
-            const result = await ipc.invoke('mixer:render', { playlistId, format, quality });
+            const result = await ipc.invoke('mixer:render', {
+                playlistId, format, quality,
+                normalizeLoudness: normLoud,
+                maxTempoSlope: tempoSlope,
+                maxPitchSlope: pitchSlope,
+            });
             if (result.canceled) {
                 setRendering(false);
                 return;
@@ -161,6 +169,41 @@ const RenderModal: React.FC<Props> = ({ playlistId, onClose }) => {
                                     </button>
                                 ))}
                             </div>
+                        </div>
+
+                        {/* Mix settings (applied at render — no need to regenerate) */}
+                        <div className="mb-6">
+                            <label className="text-xs font-bold text-text-muted uppercase tracking-widest mb-3 block">Rendu</label>
+
+                            <button
+                                type="button"
+                                disabled={rendering}
+                                onClick={() => setNormLoud(v => !v)}
+                                style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.06)', background: 'rgba(255,255,255,0.03)', cursor: 'pointer', marginBottom: 12 }}>
+                                <div style={{ textAlign: 'left' }}>
+                                    <div style={{ fontSize: 13, fontWeight: 600 }}>Égaliser le volume</div>
+                                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Aucun morceau beaucoup plus fort qu'un autre</div>
+                                </div>
+                                <span style={{ width: 40, height: 22, borderRadius: 100, background: normLoud ? 'var(--accent)' : 'rgba(255,255,255,0.12)', position: 'relative', flexShrink: 0, transition: 'all .2s' }}>
+                                    <span style={{ position: 'absolute', top: 2, left: normLoud ? 20 : 2, width: 18, height: 18, borderRadius: '50%', background: '#fff', transition: 'left .2s' }} />
+                                </span>
+                            </button>
+
+                            <div style={{ marginBottom: 10 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                                    <span style={{ fontWeight: 600 }}>Pente tempo · max</span>
+                                    <span style={{ color: 'var(--accent)', fontFamily: 'JetBrains Mono, monospace' }}>{tempoSlope.toFixed(1)} BPM/s</span>
+                                </div>
+                                <input type="range" min={0.5} max={12} step={0.5} value={tempoSlope} disabled={rendering} onChange={e => setTempoSlope(+e.target.value)} style={{ width: '100%', accentColor: 'var(--accent)' }} />
+                            </div>
+                            <div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                                    <span style={{ fontWeight: 600 }}>Pente pitch · max</span>
+                                    <span style={{ color: 'var(--accent)', fontFamily: 'JetBrains Mono, monospace' }}>{pitchSlope.toFixed(2)} ½ton/s</span>
+                                </div>
+                                <input type="range" min={0.02} max={1} step={0.01} value={pitchSlope} disabled={rendering} onChange={e => setPitchSlope(+e.target.value)} style={{ width: '100%', accentColor: 'var(--accent)' }} />
+                            </div>
+                            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>Plus bas = pentes plus douces. Appliqué au rendu (pas besoin de régénérer).</div>
                         </div>
 
                         {/* Progress */}

@@ -1,4 +1,4 @@
-import { isCompatible } from './camelot';
+import { camelotScore } from './camelot';
 import { Track } from '../../src/types';
 
 export interface CompatibilityScore {
@@ -23,8 +23,8 @@ export function scoreTrack(
   const bpmDelta = Math.abs(candidate.bpm - currentBpm) / currentBpm;
   const bpmScore = Math.max(0, 1 - (bpmDelta / 0.03));
 
-  // Key score: 1.0 if compatible, 0.0 if not
-  const keyScore = isCompatible(currentKey, candidate.key_camelot) ? 1.0 : 0.0;
+  // Key score: graduated harmonic compatibility (outro→intro keys passed by caller).
+  const keyScore = camelotScore(currentKey, (candidate as any).intro_key_camelot ?? candidate.key_camelot);
 
   // Energy score: Gaussian-like match
   const energyDelta = Math.abs(candidate.energy - targetEnergy);
@@ -43,11 +43,12 @@ export function scoreTrack(
   // Recency penalty
   const recencyScore = recentlyPlayed.has(candidate.track_id) ? 0.0 : 1.0;
 
+  // Harmonic compatibility weighted a bit higher — a strong preference, not a rule.
   const total = (
     bpmScore * 0.25 +
-    keyScore * 0.30 +
-    energyScore * 0.20 +
-    similarityScore * 0.15 +
+    keyScore * 0.38 +
+    energyScore * 0.15 +
+    similarityScore * 0.12 +
     recencyScore * 0.10
   );
 

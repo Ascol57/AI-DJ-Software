@@ -430,7 +430,8 @@ function registerIpcHandlers(win: BrowserWindow) {
 
   ipcMain.handle('mixer:render', async (
     _event,
-    { playlistId, format, quality }: { playlistId: string; format: RenderFormat; quality: RenderQuality }
+    { playlistId, format, quality, maxPitchSlope, maxTempoSlope, normalizeLoudness }:
+      { playlistId: string; format: RenderFormat; quality: RenderQuality; maxPitchSlope?: number; maxTempoSlope?: number; normalizeLoudness?: boolean }
   ) => {
     const playlist = await sequencer.loadPlaylist(playlistId);
     if (!playlist) throw new Error('Playlist not found');
@@ -459,6 +460,7 @@ function registerIpcHandlers(win: BrowserWindow) {
       outro_key_camelot: (pt.track as any).outro_key_camelot ?? (pt.track as any).key_camelot,
       intro_key_camelot: (pt.track as any).intro_key_camelot ?? (pt.track as any).key_camelot,
       key_confidence: (pt.track as any).key_confidence,
+      loudness_lufs: (pt.track as any).loudness_lufs,
     }));
 
     await renderMix({
@@ -466,8 +468,10 @@ function registerIpcHandlers(win: BrowserWindow) {
       output_path: filePath,
       format,
       quality,
-      maxPitchSlope: (playlist as any).max_pitch_slope ?? undefined,
-      maxTempoSlope: (playlist as any).max_tempo_slope ?? undefined,
+      // Render-time overrides (from the Render dialog) win over the playlist's stored values.
+      maxPitchSlope: maxPitchSlope ?? (playlist as any).max_pitch_slope ?? undefined,
+      maxTempoSlope: maxTempoSlope ?? (playlist as any).max_tempo_slope ?? undefined,
+      normalizeLoudness,
       onProgress: (pct, currentTrack) => {
         win.webContents.send('mixer:render-progress', { percent: pct, track: currentTrack });
       },
@@ -504,6 +508,7 @@ function registerIpcHandlers(win: BrowserWindow) {
       outro_key_camelot: (pt.track as any).outro_key_camelot ?? (pt.track as any).key_camelot,
       intro_key_camelot: (pt.track as any).intro_key_camelot ?? (pt.track as any).key_camelot,
       key_confidence: (pt.track as any).key_confidence,
+      loudness_lufs: (pt.track as any).loudness_lufs,
     });
 
     const { wav, blendStartMs, blendDurMs } = await renderTransitionPreview(toRT(pts[index]), toRT(pts[index + 1]), {
