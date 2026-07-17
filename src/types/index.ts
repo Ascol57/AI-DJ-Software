@@ -190,6 +190,10 @@ export interface PlaylistParams {
   preview_mode?: boolean;
   /** Max milliseconds per track in preview mode (e.g. 29000 for 29s) */
   max_segment_ms?: number;
+  /** Max slope of the pitch settle in semitones/second (gentler = smaller). */
+  max_pitch_slope_per_s?: number;
+  /** Max slope of the tempo settle in BPM/second (e.g. 3). */
+  max_tempo_slope_bpm_per_s?: number;
 }
 
 export interface AuditEvent {

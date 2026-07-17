@@ -11,6 +11,7 @@ import { useVirtual } from 'react-virtual';
 import { useStore } from '../../store';
 import { Track } from '../../types';
 import StemView from '../Waveform/StemView';
+import CueEditorDrawer from './CueEditorDrawer';
 
 const ipc = (window as any).electron;
 
@@ -57,6 +58,7 @@ const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, track, onClose, onFindS
     <div ref={menuRef} style={style}
       className="bg-bg-surface-3 border border-white/10 rounded-xl shadow-2xl p-1.5 w-48 backdrop-blur-xl">
       {item('Find Similar', '🔍', () => onFindSimilar(track))}
+      {item('Début / Fin (cue)', '✂️', () => { (LibraryTable as any).__openCues?.(track); })}
       {item('Separate Stems', '⚡', () => { (LibraryTable as any).__openStems?.(track.track_id); })}
       <div className="h-px bg-white/5 my-1" />
       {item('Load to Deck A', '🅐', () => ipc.invoke('mixer:load-track', { deck: 'A', trackId: track.track_id }))}
@@ -176,14 +178,19 @@ const LibraryTable: React.FC = () => {
   const [similarDrawer, setSimilarDrawer] = useState<Track | null>(null);
   const [stemTrackId, setStemTrackId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [cueTrack, setCueTrack] = useState<Track | null>(null);
 
-  // Allow ContextMenu to open stems drawer via static ref
+  // Allow ContextMenu to open drawers via static refs
   useEffect(() => {
     (LibraryTable as any).__openStems = (trackId: string) => {
       setStemTrackId(trackId);
       setSimilarDrawer(null);
     };
-    return () => { (LibraryTable as any).__openStems = null; };
+    (LibraryTable as any).__openCues = (track: Track) => {
+      setCueTrack(track);
+      setStemTrackId(null); setSimilarDrawer(null);
+    };
+    return () => { (LibraryTable as any).__openStems = null; (LibraryTable as any).__openCues = null; };
   }, []);
 
   const columns = useMemo<ColumnDef<Track>[]>(() => [
@@ -469,6 +476,11 @@ const LibraryTable: React.FC = () => {
             sourceTrack={similarDrawer}
             onClose={() => setSimilarDrawer(null)}
           />
+        )}
+
+        {/* Cue (start/end) Editor Drawer */}
+        {cueTrack && (
+          <CueEditorDrawer trackId={cueTrack.track_id} title={`${cueTrack.title} — ${cueTrack.artist}`} onClose={() => setCueTrack(null)} />
         )}
 
         {/* Stem View Drawer */}

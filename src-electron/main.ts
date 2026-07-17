@@ -18,6 +18,7 @@ import { writeTags } from './database/tagger';
 import { SmartFolderRepository, SmartFolderRule } from './database/smartfolders';
 import { enrichTrack } from './database/musicbrainz';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as crypto from 'crypto';
 
 let db: DatabaseManager;
@@ -156,6 +157,32 @@ function registerIpcHandlers(win: BrowserWindow) {
     return { success: true };
   });
 
+  // Per-track mix START / END points, respected by the sequencer in every mix.
+  ipcMain.handle('track:get-cues', async (_event, trackId: string) =>
+    db.get<any>('SELECT user_start_ms, user_end_ms, duration_ms, intro_end_ms, outro_start_ms FROM tracks t LEFT JOIN audio_features f ON t.track_id = f.track_id WHERE t.track_id = ?', [trackId]));
+
+  ipcMain.handle('track:set-cues', async (_event, { trackId, start_ms, end_ms }: { trackId: string; start_ms: number | null; end_ms: number | null }) => {
+    await (db as any).run('UPDATE tracks SET user_start_ms = ?, user_end_ms = ? WHERE track_id = ?', [start_ms ?? null, end_ms ?? null, trackId]);
+    return { success: true };
+  });
+
+  // Extract a short audio snippet [start_ms, end_ms] of a track (for auditioning cue points).
+  ipcMain.handle('track:preview-region', async (_event, { trackId, start_ms, end_ms }: { trackId: string; start_ms: number; end_ms: number }) => {
+    const t = await db.get<any>('SELECT file_path FROM tracks WHERE track_id = ?', [trackId]);
+    if (!t?.file_path) throw new Error('Track not found');
+    const ss = (Math.max(0, start_ms) / 1000).toFixed(3);
+    const dur = (Math.max(300, end_ms - start_ms) / 1000).toFixed(3);
+    const out = path.join(os.tmpdir(), `aidj-snip-${process.pid}-${Math.round(process.hrtime()[1])}.wav`);
+    await new Promise<void>((resolve, reject) => {
+      const p = spawn('ffmpeg', ['-y', '-v', 'error', '-ss', ss, '-t', dur, '-i', t.file_path, '-ac', '2', '-ar', '44100', '-acodec', 'pcm_s16le', out]);
+      p.on('close', (c) => (c === 0 ? resolve() : reject(new Error('ffmpeg ' + c))));
+      p.on('error', reject);
+    });
+    const buf = fs.readFileSync(out);
+    try { fs.unlinkSync(out); } catch { /* ignore */ }
+    return { wavBase64: buf.toString('base64') };
+  });
+
   // Re-analyse the WHOLE library from scratch (re-computes bpm/key/beats + the new
   // intro/outro key & tempo). Marks every track pending and drains the queue.
   ipcMain.handle('library:reanalyze-all', async () => {
@@ -202,6 +229,22 @@ function registerIpcHandlers(win: BrowserWindow) {
   ipcMain.handle('playlist:create', async (_event, params) => {
     const id = await playlistRepo.createPlaylist(params);
     return { playlist_id: id };
+  });
+
+  // Manually fine-tune one transition: the outgoing track's mix-out (cue_out) & blend
+  // length, and the incoming track's mix-in (cue_in). `position` = outgoing track position.
+  ipcMain.handle('playlist:update-transition', async (
+    _event,
+    { playlistId, position, cue_out_ms, transition_duration_ms, next_cue_in_ms }:
+      { playlistId: string; position: number; cue_out_ms?: number; transition_duration_ms?: number; next_cue_in_ms?: number }
+  ) => {
+    if (cue_out_ms != null)
+      await (db as any).run('UPDATE playlist_tracks SET cue_out_ms = ? WHERE playlist_id = ? AND position = ?', [Math.round(cue_out_ms), playlistId, position]);
+    if (transition_duration_ms != null)
+      await (db as any).run('UPDATE playlist_tracks SET transition_duration_ms = ? WHERE playlist_id = ? AND position = ?', [Math.round(transition_duration_ms), playlistId, position]);
+    if (next_cue_in_ms != null)
+      await (db as any).run('UPDATE playlist_tracks SET cue_in_ms = ? WHERE playlist_id = ? AND position = ?', [Math.round(next_cue_in_ms), playlistId, position + 1]);
+    return { success: true };
   });
 
   ipcMain.handle('playlist:delete', async (_event, playlistId: string) => {
@@ -423,6 +466,8 @@ function registerIpcHandlers(win: BrowserWindow) {
       output_path: filePath,
       format,
       quality,
+      maxPitchSlope: (playlist as any).max_pitch_slope ?? undefined,
+      maxTempoSlope: (playlist as any).max_tempo_slope ?? undefined,
       onProgress: (pct, currentTrack) => {
         win.webContents.send('mixer:render-progress', { percent: pct, track: currentTrack });
       },
@@ -461,7 +506,10 @@ function registerIpcHandlers(win: BrowserWindow) {
       key_confidence: (pt.track as any).key_confidence,
     });
 
-    const { wav, blendStartMs, blendDurMs } = await renderTransitionPreview(toRT(pts[index]), toRT(pts[index + 1]));
+    const { wav, blendStartMs, blendDurMs } = await renderTransitionPreview(toRT(pts[index]), toRT(pts[index + 1]), {
+      maxPitchSlope: (playlist as any).max_pitch_slope ?? undefined,
+      maxTempoSlope: (playlist as any).max_tempo_slope ?? undefined,
+    });
     return {
       wavBase64: wav.toString('base64'),
       blendStartMs,

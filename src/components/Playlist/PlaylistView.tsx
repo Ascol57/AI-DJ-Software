@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useStore } from '../../store';
 import { Playlist, PlaylistParams, EnergyArc } from '../../types';
 import AutomationLane from './AutomationLane';
+import TransitionEditor from './TransitionEditor';
 import { useTransitionPreview } from './useTransitionPreview';
 import { TransitionPreviewBar } from './TransitionPreviewBar';
 
@@ -97,6 +98,8 @@ const GenerateModal: React.FC<GenerateModalProps> = ({ onGenerate, onClose, isGe
   const [moodArc, setMoodArc] = useState<EnergyArc>('wave');
   const [previewMode, setPreviewMode] = useState(false);
   const [maxSeg, setMaxSeg] = useState(29);
+  const [tempoSlope, setTempoSlope] = useState(3);      // BPM/s (max)
+  const [pitchSlope, setPitchSlope] = useState(0.15);   // semitones/s (max)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -107,6 +110,8 @@ const GenerateModal: React.FC<GenerateModalProps> = ({ onGenerate, onClose, isGe
       mood_arc: moodArc,
       preview_mode: previewMode,
       max_segment_ms: previewMode ? maxSeg * 1000 : undefined,
+      max_tempo_slope_bpm_per_s: tempoSlope,
+      max_pitch_slope_per_s: pitchSlope,
     });
   };
 
@@ -203,6 +208,30 @@ const GenerateModal: React.FC<GenerateModalProps> = ({ onGenerate, onClose, isGe
             )}
           </div>
 
+          {/* Slope limits (pitch & tempo settle) */}
+          <div>
+            <label style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-muted)', display: 'block', marginBottom: 8 }}>
+              Douceur des pentes
+            </label>
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                <span style={{ fontWeight: 600 }}>Tempo <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>· max</span></span>
+                <span style={{ color: 'var(--accent)', fontFamily: 'JetBrains Mono, monospace' }}>{tempoSlope.toFixed(1)} BPM/s</span>
+              </div>
+              <input type="range" min={0.5} max={12} step={0.5} value={tempoSlope} onChange={e => setTempoSlope(+e.target.value)} style={{ width: '100%', accentColor: 'var(--accent)' }} />
+            </div>
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                <span style={{ fontWeight: 600 }}>Pitch <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>· max</span></span>
+                <span style={{ color: 'var(--accent)', fontFamily: 'JetBrains Mono, monospace' }}>{pitchSlope.toFixed(2)} ½ton/s</span>
+              </div>
+              <input type="range" min={0.02} max={1} step={0.01} value={pitchSlope} onChange={e => setPitchSlope(+e.target.value)} style={{ width: '100%', accentColor: 'var(--accent)' }} />
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
+              Plus bas = pentes plus douces (le retour au tempo/tonalité naturel prend plus de temps).
+            </div>
+          </div>
+
           {/* Energy Arc */}
           <div>
             <label style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-muted)', display: 'block', marginBottom: 8 }}>Energy Arc</label>
@@ -279,6 +308,11 @@ const PlaylistView: React.FC = () => {
   const [exporting, setExporting] = useState(false);
   const [selectedTrackIdx, setSelectedTrackIdx] = useState<number | null>(null);
   const { state: previewState, preview: previewTransition, stop: stopPreview } = useTransitionPreview(activePlaylist?.playlist_id);
+  const reloadActive = useCallback(async () => {
+    if (!activePlaylist) return;
+    const fresh = await el.invoke('playlist:get', activePlaylist.playlist_id);
+    if (fresh) setActivePlaylist(fresh);
+  }, [activePlaylist, setActivePlaylist]);
 
   const loadPlaylists = useCallback(async () => {
     try { setPlaylists((await el.invoke('playlist:list')) ?? []); } catch { }
@@ -551,6 +585,25 @@ const PlaylistView: React.FC = () => {
                             {isSelected && (
                               <tr style={{ background: 'rgba(108,99,255,0.04)', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
                                 <td colSpan={7} style={{ padding: 0 }}>
+                                  {idx < (activePlaylist.tracks ?? []).length - 1 && (() => {
+                                    const next = (activePlaylist.tracks ?? [])[idx + 1];
+                                    return (
+                                      <TransitionEditor
+                                        playlistId={activePlaylist.playlist_id}
+                                        position={pt.position}
+                                        idx={idx}
+                                        cueOutMs={pt.cue_out_ms ?? 0}
+                                        transitionMs={pt.transition_duration_ms ?? 8000}
+                                        nextCueInMs={next.cue_in_ms ?? 0}
+                                        outDurationMs={pt.track.duration_ms ?? 0}
+                                        nextDurationMs={next.track.duration_ms ?? 0}
+                                        fromTitle={pt.track.title}
+                                        toTitle={next.track.title}
+                                        onPreview={previewTransition}
+                                        onSaved={reloadActive}
+                                      />
+                                    );
+                                  })()}
                                   <AutomationLane
                                     playlistId={activePlaylist.playlist_id}
                                     trackId={pt.track.track_id}

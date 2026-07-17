@@ -117,10 +117,10 @@ export class PlaylistSequencer {
 
     // Initial item in our sequence
     // In preview mode: cue at the drop (most energetic section) for immediate impact
-    const seedCueIn = previewMode ? (currentTrack.drop_start_ms ?? 0) : 0;
+    const seedCueIn = previewMode ? (currentTrack.drop_start_ms ?? 0) : ((currentTrack as any).user_start_ms ?? 0);
     const seedCueOut = previewMode
       ? Math.min(seedCueIn + maxSegMs, currentTrack.duration_ms)
-      : currentTrack.duration_ms;
+      : ((currentTrack as any).user_end_ms ?? currentTrack.duration_ms);
 
     playlistTracks.push({
       position: 1,
@@ -194,11 +194,13 @@ export class PlaylistSequencer {
       const lastPt = playlistTracks[playlistTracks.length - 1];
       const transition = planTransition(
         currentTrack.bpm,
-        currentTrack.outro_start_ms || (currentTrack.duration_ms * 0.85),
+        // Prefer the user-set END point, else the detected outro.
+        (currentTrack as any).user_end_ms || currentTrack.outro_start_ms || (currentTrack.duration_ms * 0.85),
         currentTrack.duration_ms,
         lastPt.cue_in_ms,
         nextTrack.bpm,
-        nextTrack.intro_end_ms || (nextTrack.duration_ms * 0.08),
+        // Prefer the user-set START point, else the detected intro end.
+        (nextTrack as any).user_start_ms || nextTrack.intro_end_ms || (nextTrack.duration_ms * 0.08),
         nextTrack.duration_ms,
         currentTrack.genre_primary,
         nextTrack.genre_primary,
@@ -206,8 +208,8 @@ export class PlaylistSequencer {
         nextTrack.vocal_segments_ms || []
       );
 
-      // 3. Update the EXITING track
-      lastPt.cue_out_ms = transition.cue_out_ms;
+      // 3. Update the EXITING track (respect the user-set END point exactly)
+      lastPt.cue_out_ms = (currentTrack as any).user_end_ms ?? transition.cue_out_ms;
       lastPt.transition_type = transition.transition_type;
       lastPt.transition_duration_ms = transition.transition_duration_ms;
       lastPt.automation = [
@@ -219,7 +221,7 @@ export class PlaylistSequencer {
       // In preview mode: cue at drop, cap to max_segment_ms, use cut transition
       const incomingCueIn = previewMode
         ? (nextTrack.drop_start_ms ?? Math.floor(nextTrack.duration_ms * 0.15))
-        : transition.cue_in_ms;
+        : ((nextTrack as any).user_start_ms ?? transition.cue_in_ms);
       const incomingCueOut = previewMode
         ? Math.min(incomingCueIn + maxSegMs, nextTrack.duration_ms)
         : nextTrack.duration_ms;
@@ -255,8 +257,9 @@ export class PlaylistSequencer {
     const now = new Date().toISOString();
     const mixName = params.name || `AI Mix ${params.mood_arc} ${new Date().toLocaleDateString()}`;
 
-    await this.db.run(`INSERT INTO playlists (playlist_id, name, energy_arc, total_duration_ms, track_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [playlistId, mixName, params.mood_arc, elapsedMs, playlistTracks.length, now, now]);
+    await this.db.run(`INSERT INTO playlists (playlist_id, name, energy_arc, total_duration_ms, track_count, created_at, updated_at, max_pitch_slope, max_tempo_slope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [playlistId, mixName, params.mood_arc, elapsedMs, playlistTracks.length, now, now,
+        (params as any).max_pitch_slope_per_s ?? null, (params as any).max_tempo_slope_bpm_per_s ?? null]);
 
     for (const pt of playlistTracks) {
       await this.db.run(`INSERT INTO playlist_tracks (playlist_id, track_id, position, cue_in_ms, cue_out_ms, transition_type, transition_duration_ms, automation_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS tracks (
     quality_flag INTEGER DEFAULT 0,
     is_analyzed BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    analyzed_at DATETIME
+    analyzed_at DATETIME,
+    user_start_ms INTEGER,
+    user_end_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS audio_features (
@@ -81,7 +83,9 @@ CREATE TABLE IF NOT EXISTS playlists (
     total_duration_ms INTEGER DEFAULT 0,
     track_count INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    max_pitch_slope REAL,
+    max_tempo_slope REAL
 );
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -177,4 +181,8 @@ export const COLUMN_MIGRATIONS: string[] = [
     `ALTER TABLE audio_features ADD COLUMN intro_key_camelot TEXT`,
     `ALTER TABLE audio_features ADD COLUMN outro_key_camelot TEXT`,
     `ALTER TABLE audio_features ADD COLUMN key_changes INTEGER DEFAULT 0`,
+    `ALTER TABLE tracks ADD COLUMN user_start_ms INTEGER`,
+    `ALTER TABLE tracks ADD COLUMN user_end_ms INTEGER`,
+    `ALTER TABLE playlists ADD COLUMN max_pitch_slope REAL`,
+    `ALTER TABLE playlists ADD COLUMN max_tempo_slope REAL`,
 ];

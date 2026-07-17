@@ -62,9 +62,17 @@ export interface RenderOptions {
     format: RenderFormat;
     quality: RenderQuality;
     sample_rate?: number;
+    /** Max slope of the post-blend pitch settle, in semitones/second (gentler = smaller). */
+    maxPitchSlope?: number;
+    /** Max slope of the post-blend tempo settle, in BPM/second (gentler = smaller). */
+    maxTempoSlope?: number;
     onProgress?: (percent: number, currentTrack: string) => void;
     onError?: (msg: string) => void;
 }
+
+// Defaults if a playlist doesn't specify slope limits.
+export const DEFAULT_MAX_PITCH_SLOPE = 0.15; // semitones/s
+export const DEFAULT_MAX_TEMPO_SLOPE = 3;    // BPM/s
 
 const QUALITY_SETTINGS: Record<RenderFormat, Record<RenderQuality, string[]>> = {
     wav: {
@@ -107,23 +115,10 @@ const warpOf = (bpmA: number, bpmB: number) => {
     return Math.max(0.5, Math.min(r, 2.0));
 };
 
-// How long (seconds) the incoming track takes to glide from the mixed key back to its
-// own natural key — a long, gentle slope so the pitch correction is imperceptible.
-const PITCH_SETTLE_S = 20;
 // Below this key-detection confidence we don't trust the key, so we don't pitch-shift
 // (avoids landing on the wrong key relative to the previous track).
 const PITCH_MIN_KEY_CONFIDENCE = 0.5;
 
-// Timed asendcmd list to glide a named rubberband instance's `pitch` from→to (ratios)
-// across `durS` seconds — a smooth pitch slope.
-const pitchRamp = (inst: string, from: number, to: number, durS: number, steps = 24) => {
-    const parts: string[] = [];
-    for (let k = 0; k <= steps; k++) {
-        const frac = k / steps;
-        parts.push(`${(frac * durS).toFixed(3)} ${inst} pitch ${(from + (to - from) * frac).toFixed(5)}`);
-    }
-    return parts.join('; ');
-};
 
 /**
  * Compute a phase-locked blend window for an A→B pair (null = hard cut, td=0).
@@ -164,7 +159,7 @@ export function computeBlendPlan(A: RenderTrack, B: RenderTrack): BlendPlan | nu
 export async function renderTransitionPreview(
     A: RenderTrack,
     B: RenderTrack,
-    opts: { preRollMs?: number; postRollMs?: number; sample_rate?: number } = {}
+    opts: { preRollMs?: number; postRollMs?: number; sample_rate?: number; maxPitchSlope?: number; maxTempoSlope?: number } = {}
 ): Promise<{ wav: Buffer; blendStartMs: number; blendDurMs: number }> {
     const preRoll = opts.preRollMs ?? 5000;
     const postRoll = opts.postRollMs ?? 5000;
@@ -189,7 +184,7 @@ export async function renderTransitionPreview(
 
     const out = path.join(os.tmpdir(), `aidj-preview-${process.pid}-${Math.round(process.hrtime()[1])}.wav`);
     try {
-        await renderMix({ tracks: [Ap, Bp], output_path: out, format: 'wav', quality: 'standard', sample_rate: sr });
+        await renderMix({ tracks: [Ap, Bp], output_path: out, format: 'wav', quality: 'standard', sample_rate: sr, maxPitchSlope: opts.maxPitchSlope, maxTempoSlope: opts.maxTempoSlope });
         return { wav: fs.readFileSync(out), blendStartMs, blendDurMs };
     } finally {
         try { fs.unlinkSync(out); } catch { /* ignore */ }
@@ -218,6 +213,8 @@ async function probeDuration(filePath: string): Promise<number> {
 
 export async function renderMix(opts: RenderOptions): Promise<void> {
     const { tracks, output_path, format, quality, sample_rate = 44100, onProgress, onError } = opts;
+    const maxPitchSlope = opts.maxPitchSlope && opts.maxPitchSlope > 0 ? opts.maxPitchSlope : DEFAULT_MAX_PITCH_SLOPE;
+    const maxTempoSlope = opts.maxTempoSlope && opts.maxTempoSlope > 0 ? opts.maxTempoSlope : DEFAULT_MAX_TEMPO_SLOPE;
 
     if (tracks.length === 0) throw new Error('No tracks to render');
     if (tracks.length === 1) {
@@ -308,15 +305,28 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                 const ss = (soloStart / 1000).toFixed(3);
                 const se = (soloEnd / 1000).toFixed(3);
 
-                // The previous blend held this track in the previous track's key. Now glide
-                // it back to its own natural key over a LONG, gentle slope (PITCH_SETTLE_S)
-                // so the correction is imperceptible — not an abrupt few-second shift.
-                const inShift = (i > 0 && trans[i - 1]) ? (trans[i - 1]!.pitchSemitones || 0) : 0;
+                // During the previous blend this track was held at the previous track's KEY
+                // and TEMPO (constant, for beat-lock). Now glide BOTH back to its own natural
+                // key and tempo over a LONG, gentle slope (PITCH_SETTLE_S) — so neither the
+                // pitch nor the tempo jumps at the blend→body seam.
+                const prev = i > 0 ? trans[i - 1] : null;
+                const fromPitch = prev ? Math.pow(2, (prev.pitchSemitones || 0) / 12) : 1;
+                const fromTempo = prev ? (prev.warp || 1) : 1;
                 let soloChain = `[0:a]atrim=start=${ss}:end=${se},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo`;
-                if (inShift !== 0) {
-                    const from = Math.pow(2, inShift / 12);
-                    const settleS = Math.min(PITCH_SETTLE_S, soloDur / 1000);
-                    soloChain += `,asendcmd=c='${pitchRamp('rubberband@rbs', from, 1.0, settleS)}',rubberband@rbs=pitch=${from.toFixed(5)}`;
+                if (Math.abs(fromPitch - 1) > 1e-4 || Math.abs(fromTempo - 1) > 1e-3) {
+                    // Settle long enough that NEITHER slope exceeds its max rate:
+                    //   pitch: |semitones| / maxPitchSlope   |   tempo: ΔBPM / maxTempoSlope
+                    const pitchChange = Math.abs((prev?.pitchSemitones) || 0);                 // semitones
+                    const tempoChangeBpm = (t.bpm || 0) * Math.abs(fromTempo - 1);              // BPM
+                    const needS = Math.max(pitchChange / maxPitchSlope, tempoChangeBpm / maxTempoSlope);
+                    const settleS = Math.max(1, Math.min(needS, soloDur / 1000, 120));
+                    const steps = 24, cmds: string[] = [];
+                    for (let k = 0; k <= steps; k++) {
+                        const frac = k / steps, ts = (frac * settleS).toFixed(3);
+                        cmds.push(`${ts} rubberband@rbs pitch ${(fromPitch + (1 - fromPitch) * frac).toFixed(5)}`);
+                        cmds.push(`${ts} rubberband@rbs tempo ${(fromTempo + (1 - fromTempo) * frac).toFixed(5)}`);
+                    }
+                    soloChain += `,asendcmd=c='${cmds.join('; ')}',rubberband@rbs=pitch=${fromPitch.toFixed(5)}:tempo=${fromTempo.toFixed(5)}`;
                 }
                 const filterSoloStr = `${soloChain}[out]`;
 

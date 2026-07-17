@@ -107,12 +107,17 @@ export function planTransition(
   }
 
   // 3. Outgoing Segment (A)
-  // Exit at the outro so the track plays out and the blend lands near the END of the
-  // song (proper DJ behaviour). No artificial 29s cap — this is a local mixing tool.
-  // (outro detection can occasionally report past the track end, so guard against that.)
+  // Exit at the outro so the blend lands near the END of the song. No artificial 29s cap.
   let finalCueOutMs = (trackAOutroStartMs > 0 && trackAOutroStartMs < trackADurationMs)
     ? trackAOutroStartMs
     : Math.round(trackADurationMs * 0.9);
+
+  // Safety net only: if the outro was detected absurdly early (<55% of the track),
+  // don't cut half the song — fall back to 85%. Otherwise trust the detected outro.
+  // (Per-transition fine-tuning is done manually in the UI, not by global heuristics.)
+  if (finalCueOutMs < trackADurationMs * 0.55) {
+    finalCueOutMs = Math.round(trackADurationMs * 0.85);
+  }
 
   // Boundary check
   if (finalCueOutMs > trackADurationMs) finalCueOutMs = trackADurationMs;
