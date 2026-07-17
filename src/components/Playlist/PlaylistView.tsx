@@ -2,6 +2,8 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useStore } from '../../store';
 import { Playlist, PlaylistParams, EnergyArc } from '../../types';
 import AutomationLane from './AutomationLane';
+import { useTransitionPreview } from './useTransitionPreview';
+import { TransitionPreviewBar } from './TransitionPreviewBar';
 
 const el = (window as any).electron;
 
@@ -276,6 +278,7 @@ const PlaylistView: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [selectedTrackIdx, setSelectedTrackIdx] = useState<number | null>(null);
+  const { state: previewState, preview: previewTransition, stop: stopPreview } = useTransitionPreview(activePlaylist?.playlist_id);
 
   const loadPlaylists = useCallback(async () => {
     try { setPlaylists((await el.invoke('playlist:list')) ?? []); } catch { }
@@ -525,6 +528,21 @@ const PlaylistView: React.FC = () => {
                                     {pt.transition_type.replace('_', ' ')}
                                   </span>
                                 )}
+                                {idx < (activePlaylist.tracks ?? []).length - 1 && (
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); previewTransition(idx); }}
+                                    title="Préécouter la transition vers la piste suivante"
+                                    style={{
+                                      marginLeft: 8, fontSize: 11, width: 24, height: 22, lineHeight: '20px', textAlign: 'center',
+                                      padding: 0, borderRadius: 6, cursor: 'pointer',
+                                      border: '1px solid rgba(124,109,255,0.35)',
+                                      background: previewState?.idx === idx ? 'rgba(124,109,255,0.28)' : 'rgba(124,109,255,0.08)',
+                                      color: 'var(--accent)',
+                                    }}
+                                  >
+                                    {previewState?.idx === idx ? (previewState.loading ? '⏳' : '⏹') : '▶'}
+                                  </button>
+                                )}
                               </td>
                               <td style={{ padding: '10px 8px', width: 24, textAlign: 'center' }}>
                                 <span style={{ fontSize: 10, color: 'var(--text-muted)', opacity: 0.5 }}>{isSelected ? '▲' : '▼'}</span>
@@ -552,6 +570,7 @@ const PlaylistView: React.FC = () => {
           )}
         </div>
       </div>
+      <TransitionPreviewBar state={previewState} onStop={stopPreview} />
     </>
   );
 };

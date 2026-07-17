@@ -274,7 +274,7 @@ export class PlaylistSequencer {
     const pl = await this.db.get<any>('SELECT * FROM playlists WHERE playlist_id = ?', [playlistId]);
     if (!pl) return null;
     const pts = await this.db.all<any>(`
-      SELECT pt.*, t.*, f.bpm, f.key_camelot, f.energy, c.genre_primary, c.mood_primary
+      SELECT pt.*, t.*, f.bpm, f.key_camelot, f.energy, f.beatgrid_json, c.genre_primary, c.mood_primary
       FROM playlist_tracks pt
       JOIN tracks t ON pt.track_id = t.track_id
       LEFT JOIN audio_features f ON t.track_id = f.track_id
@@ -283,14 +283,19 @@ export class PlaylistSequencer {
     `, [playlistId]);
 
     return {
-      ...pl, tracks: pts.map(row => ({
+      ...pl, tracks: pts.map(row => {
+        // Parse the stored beat grid so the renderer can phase-lock transitions.
+        let beat_frames_ms: number[] = [];
+        try { beat_frames_ms = row.beatgrid_json ? JSON.parse(row.beatgrid_json) : []; } catch { beat_frames_ms = []; }
+        return {
         position: row.position,
-        track: { ...row, is_analyzed: row.is_analyzed === 1 } as Track,
+        track: { ...row, beat_frames_ms, is_analyzed: row.is_analyzed === 1 } as Track,
         cue_in_ms: row.cue_in_ms, cue_out_ms: row.cue_out_ms,
         transition_type: row.transition_type as CrossfadeType,
         transition_duration_ms: row.transition_duration_ms,
         automation: JSON.parse(row.automation_json ?? '[]'),
-      } as PlaylistTrack))
+      } as PlaylistTrack;
+      })
     };
   }
 

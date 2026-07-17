@@ -19,6 +19,9 @@ export interface RenderTrack {
     title: string;
     artist: string;
     bpm: number;
+    /** First detected beat (ms) — anchor for the constant-tempo beat grid used for phase-locking. */
+    first_beat_ms?: number;
+    transition_type?: string;
 }
 
 export interface RenderOptions {
@@ -48,6 +51,79 @@ const QUALITY_SETTINGS: Record<RenderFormat, Record<RenderQuality, string[]>> = 
         compressed: ['-codec:a', 'flac', '-compression_level', '3'],
     },
 };
+
+/** Phase-locked blend window for one A→B pair (shared by the renderer and the preview). */
+export interface BlendPlan { aOutStart: number; aOutEnd: number; bInStart: number; bInEnd: number; warp: number; }
+
+// FFmpeg audio filters can panic on micro-transitions (<1s); cap the duration.
+const clampD = (ms: number) => (ms < 1000 ? 0 : Math.min(ms, 45000));
+// Constant-tempo beat grid anchored on each track's first detected beat.
+const beatPeriod = (bpm: number) => (bpm && bpm > 0 ? 60000 / bpm : 0);
+const snapToGrid = (ms: number, anchor: number, period: number, multiple = 1) => {
+    if (period <= 0) return ms;
+    const step = period * multiple;
+    return anchor + Math.round((ms - anchor) / step) * step;
+};
+const warpOf = (bpmA: number, bpmB: number) =>
+    Math.max(0.5, Math.min(bpmA && bpmB ? bpmA / bpmB : 1.0, 2.0));
+
+/**
+ * Compute a phase-locked blend window for an A→B pair (null = hard cut, td=0).
+ * aOut* = A's exit window snapped to its bar grid; bIn* = B's entry window. B gets
+ * `td*warp` of input so after atempo it is exactly `td` long → beat grids stay locked.
+ */
+export function computeBlendPlan(A: RenderTrack, B: RenderTrack): BlendPlan | null {
+    const td = clampD(A.transition_duration_ms);
+    if (td === 0) return null;
+    const pA = beatPeriod(A.bpm), pB = beatPeriod(B.bpm);
+    let aOutStart = snapToGrid(A.cue_out_ms - td, A.first_beat_ms ?? 0, pA, 4);
+    aOutStart = Math.max(A.cue_in_ms, Math.min(aOutStart, A.cue_out_ms - (pA || td)));
+    let bInStart = snapToGrid(B.cue_in_ms, B.first_beat_ms ?? 0, pB, 4);
+    bInStart = Math.max(0, bInStart);
+    const warp = warpOf(A.bpm, B.bpm);
+    return { aOutStart, aOutEnd: aOutStart + td, bInStart, bInEnd: bInStart + td * warp, warp };
+}
+
+/**
+ * Render a single A→B transition for auditioning: `preRollMs` of A leading into the
+ * beat-locked blend, then `postRollMs` of B leading out. Returns a WAV buffer.
+ * Reuses renderMix on a 2-track sub-playlist, so the preview is byte-identical to what
+ * the full mix produces for this transition. Also returns where the blend sits in the clip.
+ */
+export async function renderTransitionPreview(
+    A: RenderTrack,
+    B: RenderTrack,
+    opts: { preRollMs?: number; postRollMs?: number; sample_rate?: number } = {}
+): Promise<{ wav: Buffer; blendStartMs: number; blendDurMs: number }> {
+    const preRoll = opts.preRollMs ?? 5000;
+    const postRoll = opts.postRollMs ?? 5000;
+    const sr = opts.sample_rate ?? 44100;
+    const plan = computeBlendPlan(A, B);
+
+    let Ap: RenderTrack, Bp: RenderTrack, blendStartMs: number, blendDurMs: number;
+    if (plan) {
+        const aCueIn = Math.max(A.cue_in_ms, plan.aOutStart - preRoll);
+        Ap = { ...A, cue_in_ms: aCueIn };
+        Bp = { ...B, cue_out_ms: plan.bInEnd + postRoll, transition_duration_ms: 0 };
+        blendStartMs = plan.aOutStart - aCueIn;               // where the blend begins in the clip
+        blendDurMs = plan.aOutEnd - plan.aOutStart;
+    } else {
+        // Hard cut: audition a window either side of the cut, no blend.
+        const aCueIn = Math.max(A.cue_in_ms, A.cue_out_ms - preRoll);
+        Ap = { ...A, cue_in_ms: aCueIn, transition_duration_ms: 0 };
+        Bp = { ...B, cue_out_ms: B.cue_in_ms + postRoll, transition_duration_ms: 0 };
+        blendStartMs = A.cue_out_ms - aCueIn;
+        blendDurMs = 0;
+    }
+
+    const out = path.join(os.tmpdir(), `aidj-preview-${process.pid}-${Math.round(process.hrtime()[1])}.wav`);
+    try {
+        await renderMix({ tracks: [Ap, Bp], output_path: out, format: 'wav', quality: 'standard', sample_rate: sr });
+        return { wav: fs.readFileSync(out), blendStartMs, blendDurMs };
+    } finally {
+        try { fs.unlinkSync(out); } catch { /* ignore */ }
+    }
+}
 
 /** Probe total duration of an audio file using ffprobe. */
 async function probeDuration(filePath: string): Promise<number> {
@@ -91,13 +167,6 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
         const tasks: (RenderTask & { success?: boolean })[] = [];
         let totalWeight = 0;
 
-        // Safety cap helper
-        // FFmpeg audio filters (like fade/eq) can panic and return '4294967294' on micro-transitions (<1s)
-        const clampD = (ms: number) => {
-            if (ms < 1000) return 0;
-            return Math.min(ms, 45000);
-        };
-
         const safePaths = new Map<string, string>();
 
         const getSafePath = (originalPath: string, index: number, prefix: string): string | null => {
@@ -138,9 +207,14 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
             return originalPath;
         };
 
+        // ─── Pass 1: phase-locked blend window for each adjacent pair ──
+        // (shared with the transition preview via computeBlendPlan → identical output.)
+        const trans: (BlendPlan | null)[] = tracks
+            .slice(0, -1)
+            .map((A, i) => computeBlendPlan(A, tracks[i + 1]));
+
         for (let i = 0; i < tracks.length; i++) {
             const t = tracks[i];
-            const td_prev = i > 0 ? clampD(tracks[i - 1].transition_duration_ms) : 0;
             const td_curr = i < tracks.length - 1 ? clampD(tracks[i].transition_duration_ms) : 0;
 
             const safeTrackPath = getSafePath(t.file_path, i, 'track');
@@ -150,9 +224,11 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
             }
 
             // 1. Solo Portion
-            // Plays from after the previous transition ends, to before the next transition starts
-            const soloStart = t.cue_in_ms + td_prev;
-            const soloEnd = t.cue_out_ms - td_curr;
+            // Plays from where the previous blend released this track (its incoming
+            // entry end) to where the next blend grabs it (its outgoing exit start),
+            // so bodies and beat-locked blends butt together with no gap or overlap.
+            const soloStart = (i > 0 && trans[i - 1]) ? trans[i - 1]!.bInEnd : t.cue_in_ms;
+            const soloEnd = (i < tracks.length - 1 && trans[i]) ? trans[i]!.aOutStart : t.cue_out_ms;
             const soloDur = soloEnd - soloStart;
 
             if (soloDur > 0) {
@@ -176,18 +252,19 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                 totalWeight += soloDur;
             }
 
-            // 2. Transition Portion
-            if (i < tracks.length - 1 && td_curr > 0) {
+            // 2. Transition Portion (beat/phase-locked window from Pass 1)
+            const plan = i < tracks.length - 1 ? trans[i] : null;
+            if (plan && td_curr > 0) {
                 const next = tracks[i + 1];
                 const safeNextPath = getSafePath(next.file_path, i + 1, 'next');
                 if (!safeNextPath) {
                     console.warn(`[Render] Skipping transition ${i}->${i + 1}: next track inaccessible`);
                     continue;
                 }
-                const outStart = t.cue_out_ms - td_curr;
-                const outEnd = t.cue_out_ms;
-                const inStart = next.cue_in_ms;
-                const inEnd = next.cue_in_ms + td_curr;
+                const outStart = plan.aOutStart;
+                const outEnd = plan.aOutEnd;
+                const inStart = plan.bInStart;
+                const inEnd = plan.bInEnd;
 
                 const file = path.join(tmpDir, `trans_${i}.wav`);
 
@@ -216,15 +293,34 @@ export async function renderMix(opts: RenderOptions): Promise<void> {
                     filterGraphA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,afade=t=out:st=0:d=${stopDur}:curve=exp[a0];`;
                     filterGraphB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio}[a1];`;
                 } else {
-                    // Default Transition: Low EQ Swap (Phase 20)
-                    // We swap the low-end by high-passing both tracks at the crossover point
-                    // Track A: bass sweeps out (high-pass up)
-                    // Track B: bass sweeps in (high-pass down)
-                    const hp_a = `highpass=f=200*t/${dS}`;
-                    const hp_b = `highpass=f=200*(1-t/${dS})`;
+                    // Default Transition: beatmatched equal-power crossfade + bass swap.
+                    // B is tempo-warped to A's BPM (atempo); Pass-1 boundaries put both beat
+                    // grids on the same phase, so the blend is phase-locked. qsin fades give a
+                    // constant-power (no dip) crossfade for the mids/highs.
+                    //
+                    // Bass swap: a swept high-pass whose cutoff RISES on the outgoing track
+                    // (bass leaves) and FALLS on the incoming track (bass enters), so the two
+                    // kicks/basslines never stack. FFmpeg's highpass frequency can't take a
+                    // `t` expression, so we drive it at runtime with asendcmd on a *named*
+                    // filter instance (highpass@hpa / highpass@hpb) — a series of timed steps
+                    // interpolated across the blend. (This is why the old `highpass=f=200*t/…`
+                    // was invalid and silently dropped every transition.)
+                    const BASS_HZ = 240;        // how high we lift the low-cut at the swap peak
+                    const sweep = (inst: string, fromHz: number, toHz: number, durS: number, steps = 12) => {
+                        const parts: string[] = [];
+                        for (let k = 0; k <= steps; k++) {
+                            const frac = k / steps;
+                            const tSec = (frac * durS).toFixed(3);
+                            const f = Math.round(fromHz + (toHz - fromHz) * frac);
+                            parts.push(`${tSec} ${inst} frequency ${f}`);
+                        }
+                        return parts.join('; ');
+                    };
+                    const cmdsA = sweep('highpass@hpa', 20, BASS_HZ, Number(dS));   // A: bass sweeps OUT
+                    const cmdsB = sweep('highpass@hpb', BASS_HZ, 20, Number(dS));   // B: bass sweeps IN
 
-                    filterGraphA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,${hp_a},afade=t=out:st=0:d=${dS}:curve=qsin[a0];`;
-                    filterGraphB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio},${hp_b},afade=t=in:st=0:d=${dS}:curve=qsin[a1];`;
+                    filterGraphA = `[0:a]atrim=start=${osS}:end=${osE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,asendcmd=c='${cmdsA}',highpass@hpa=f=20,afade=t=out:st=0:d=${dS}:curve=qsin[a0];`;
+                    filterGraphB = `[1:a]atrim=start=${isS}:end=${isE},asetpts=PTS-STARTPTS,aresample=${sample_rate},aformat=sample_fmts=s16:channel_layouts=stereo,atempo=${warpRatio},asendcmd=c='${cmdsB}',highpass@hpb=f=${BASS_HZ},afade=t=in:st=0:d=${dS}:curve=qsin[a1];`;
                 }
 
                 const filterComplexStr = filterGraphA + filterGraphB + `[a0][a1]amix=inputs=2:duration=longest:normalize=0,aformat=sample_fmts=s16:channel_layouts=stereo[out]`;

@@ -13,7 +13,7 @@ import { DeviceManager } from './audio/devices';
 import { generateWaveform } from './audio/waveform';
 import { generateApiKey } from './security';
 import { exportM3U, exportRekordboxXml, exportSeratoXml, exportCsv } from './playlist/exporter';
-import { renderMix, RenderFormat, RenderQuality } from './audio/render';
+import { renderMix, renderTransitionPreview, RenderFormat, RenderQuality } from './audio/render';
 import { writeTags } from './database/tagger';
 import { SmartFolderRepository, SmartFolderRule } from './database/smartfolders';
 import { enrichTrack } from './database/musicbrainz';
@@ -60,7 +60,9 @@ async function initBackend() {
   } else {
     // Development: explicitly target Python 3.11 where the huge ML packages (Torch/ONNX) are installed.
     // relying on 'python' in spawn causes it to hit Python 3.13 or WindowsApps proxies.
-    sidecarCmd = process.platform === 'win32' ? 'C:\\Users\\aitsi\\AppData\\Local\\Programs\\Python\\Python311\\python.exe' : 'python3';
+    sidecarCmd = process.platform === 'win32'
+      ? path.join(app.getAppPath(), 'ml-sidecar', 'venv', 'Scripts', 'python.exe')
+      : path.join(app.getAppPath(), 'ml-sidecar', 'venv', 'bin', 'python3');
     sidecarArgs = [path.join(app.getAppPath(), 'ml-sidecar', 'main.py')];
     console.log(`[AI DJ] Starting ML sidecar (dev): ${sidecarCmd} ${sidecarArgs[0]}`);
   }
@@ -396,6 +398,8 @@ function registerIpcHandlers(win: BrowserWindow) {
       title: pt.track.title,
       artist: pt.track.artist,
       bpm: (pt.track as any).bpm ?? 128,
+      // First detected beat → anchor for phase-locked beatmatching in the renderer.
+      first_beat_ms: (pt.track as any).beat_frames_ms?.[0] ?? 0,
     }));
 
     await renderMix({
@@ -413,6 +417,39 @@ function registerIpcHandlers(win: BrowserWindow) {
 
     await db.audit('MIX_RENDER', playlistId, 'SUCCESS', `${format}:${filePath}`);
     return { filePath, format, tracks: renderTracks.length };
+  });
+
+  // Audition a single A→B transition without rendering the whole mix.
+  // Returns the short clip as base64 WAV + where the beat-locked blend sits in it.
+  ipcMain.handle('mixer:preview-transition', async (
+    _event,
+    { playlistId, index }: { playlistId: string; index: number }
+  ) => {
+    const playlist = await sequencer.loadPlaylist(playlistId);
+    if (!playlist) throw new Error('Playlist not found');
+    const pts = playlist.tracks;
+    if (index < 0 || index >= pts.length - 1) throw new Error('No transition at that position');
+
+    const toRT = (pt: any) => ({
+      file_path: (pt.track as any).file_path ?? '',
+      cue_in_ms: pt.cue_in_ms,
+      cue_out_ms: pt.cue_out_ms,
+      transition_type: pt.transition_type,
+      transition_duration_ms: pt.transition_duration_ms,
+      title: pt.track.title,
+      artist: pt.track.artist,
+      bpm: (pt.track as any).bpm ?? 128,
+      first_beat_ms: (pt.track as any).beat_frames_ms?.[0] ?? 0,
+    });
+
+    const { wav, blendStartMs, blendDurMs } = await renderTransitionPreview(toRT(pts[index]), toRT(pts[index + 1]));
+    return {
+      wavBase64: wav.toString('base64'),
+      blendStartMs,
+      blendDurMs,
+      from: pts[index].track.title,
+      to: pts[index + 1].track.title,
+    };
   });
 
   // ────────────── AUDIO SYSTEM ──────────────

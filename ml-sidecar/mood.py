@@ -12,6 +12,58 @@ MOOD_CLASSES = [
 _onnx_session = None
 _model_loaded = False
 
+# --- CLAP zero-shot mood (real model path) ---------------------------------
+# The shipped mood_hubert ONNX is a 199-byte stub, so instead we classify mood
+# by comparing a track's CLAP audio embedding against precomputed CLAP text
+# embeddings for each mood (cosine similarity in the joint space).
+# Prototypes are built by build_mood_prototypes.py → models/mood_clap_prototypes.npz
+_proto_vecs = None          # np.ndarray [12, 512], L2-normalized
+_proto_names = None         # list[str], mood class names
+_proto_scale = 1.0          # CLAP logit_scale
+_proto_loaded = False
+
+
+def _load_prototypes() -> bool:
+    global _proto_vecs, _proto_names, _proto_scale, _proto_loaded
+    if _proto_loaded:
+        return _proto_vecs is not None
+    _proto_loaded = True
+    proto_path = os.path.join(os.path.dirname(__file__), "models", "mood_clap_prototypes.npz")
+    if not os.path.exists(proto_path):
+        print("[ML] mood_clap_prototypes.npz not found — mood using heuristic")
+        return False
+    try:
+        import numpy as np
+        data = np.load(proto_path, allow_pickle=True)
+        _proto_vecs = data["vectors"].astype(np.float32)
+        _proto_names = [str(n) for n in data["names"].tolist()]
+        _proto_scale = float(data["logit_scale"]) if "logit_scale" in data else 1.0
+        print(f"[ML] CLAP mood prototypes loaded ({_proto_vecs.shape[0]} classes)")
+        return True
+    except Exception as e:
+        print(f"[ML] Failed to load mood prototypes: {e}")
+        _proto_vecs = None
+        return False
+
+
+def _clap_classify(embedding) -> dict:
+    """Zero-shot mood from a track's CLAP audio embedding vs mood text prototypes."""
+    import numpy as np
+    a = np.asarray(embedding, dtype=np.float32)
+    a = a / (np.linalg.norm(a) + 1e-9)
+    sims = _proto_vecs @ a                      # cosine sim (both L2-normalized)
+    logits = _proto_scale * sims
+    logits -= logits.max()
+    probs = np.exp(logits)
+    probs /= probs.sum()
+    order = np.argsort(-probs)
+    return {
+        "mood_primary": _proto_names[int(order[0])],
+        "mood_secondary": _proto_names[int(order[1])],
+        "mood_confidence": float(probs[order[0]]),
+        "backend": "clap_zero_shot",
+    }
+
 
 def _load_model() -> bool:
     global _onnx_session, _model_loaded
@@ -32,15 +84,29 @@ def _load_model() -> bool:
         return False
 
 
-def classify_mood(file_path: str, y=None, sr=None) -> dict:
-    """Classify mood from audio file. Falls back to valence/arousal heuristic."""
+def classify_mood(file_path: str, y=None, sr=None, embedding=None) -> dict:
+    """Classify mood from audio.
+    Priority: CLAP zero-shot (real model, needs the track's CLAP embedding) →
+    legacy mel ONNX (if a real mood.onnx is ever added) → valence/arousal heuristic.
+    """
     if not os.path.exists(file_path):
         return _unknown_mood()
 
+    # 1. CLAP zero-shot — the real-model path
+    if embedding is not None and _load_prototypes() and _proto_vecs is not None:
+        try:
+            import numpy as np
+            if float(np.linalg.norm(np.asarray(embedding, dtype=np.float32))) > 1e-6:
+                return _clap_classify(embedding)
+        except Exception as e:
+            print(f"[ML] CLAP mood inference error: {e}")
+
+    # 2. Legacy mel-spectrogram ONNX (mood.onnx), if present and valid
     if _load_model() and _onnx_session is not None:
         return _onnx_classify(file_path, y, sr)
-    else:
-        return _heuristic_mood(file_path, y, sr)
+
+    # 3. Heuristic fallback
+    return _heuristic_mood(file_path, y, sr)
 
 
 def _onnx_classify(file_path: str, y=None, sr=None) -> dict:

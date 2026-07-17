@@ -2,8 +2,14 @@ fastapi==0.111.0
 uvicorn==0.29.0
 essentia-tensorflow==2.1b6.dev1110
 librosa==0.10.2
-madmom==0.16.1
 torch==2.2.2
+torchaudio==2.2.2  # must match torch; avoids cu13 build pulling libcudart.so.13
+# NOTE: PyPI onnxruntime-gpu==1.17.1 is a CUDA 11 build (needs libcublasLt.so.11)
+# and will NOT use the GPU alongside torch's CUDA 12 libs. For GPU, reinstall the
+# CUDA-12 build from the Azure feed instead:
+#   uv pip install onnxruntime-gpu==1.17.1 \
+#     --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+# main.py preloads torch's bundled CUDA 12 / cuDNN 8 libs so the CUDA EP resolves.
 onnxruntime-gpu==1.17.1
 transformers==4.40.0
 demucs==4.0.1

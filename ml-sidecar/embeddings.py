@@ -21,8 +21,8 @@ def _load_model() -> bool:
         return False
     try:
         import onnxruntime as ort
-        _onnx_session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        print("[ML] CLAP audio embedding model loaded")
+        _onnx_session = ort.InferenceSession(model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        print(f"[ML] CLAP audio embedding model loaded ({_onnx_session.get_providers()[0]})")
         return True
     except Exception as e:
         print(f"[ML] Failed to load CLAP model: {e}")
